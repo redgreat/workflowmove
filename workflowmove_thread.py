@@ -5,7 +5,7 @@
 import pymysql
 from pymysql.cursors import DictCursor
 from datetime import datetime
-
+import threading
 
 # 创建数据库连接
 con_src = pymysql.connect(
@@ -28,6 +28,9 @@ con_his = pymysql.connect(
     cursorclass=DictCursor,
 )
 
+# 定义线程数量
+num_threads = 10  # 开启线程数量 （需要与初始化的NTIL数量一致）
+
 # 写入2023 需要迁移单据
 # CREATE TABLE serviceordercenterhis.move_workorder2023(
 #     WorkOrderId CHAR(12) PRIMARY KEY,
@@ -41,8 +44,10 @@ con_his = pymysql.connect(
 # WHERE a.CreatedAt<'2023-01-01'
 #   AND a.WorkStatus NOT IN (9);
 
-# 还需要考虑： 1.如果his库已经有此主键的单据，是让其报错还是跳出？ 2.开启多线程，是单个Batch多线程还是不同Batch多线程？
-# 3.开启多线程，需要将每单迁移逻辑调整为可调用函数
+# 还需要考虑：
+# ✔️1.如果his库已经有此主键的单据，是让其报错还是跳出？
+# ✔️2.开启多线程，是单个Batch多线程还是不同Batch多线程？
+# ✔️3.开启多线程，需要将每单迁移逻辑调整为可调用函数
 
 # 可复用SQL语句
 # 取数据SQL
@@ -55,9 +60,15 @@ sql_up = "UPDATE move_workorder2023 SET IsConsume = 1 WHERE WorkOrderId=%s;"
 
 # 通过WorkOrderId 查找ItemId
 sql_cu_item = (
-    "SELECT Id FROM workflowruntimeitems WHERE TargetEntityId=%s AND Deleted=0 LIMIT 1;"
+    "SELECT a.Id FROM workflowruntimeitems a WHERE a.TargetEntityId=%s AND a.Deleted=0 "
+    "AND NOT EXISTS(SELECT 1 FROM serviceordercenterhis.workflowruntimeitems b "
+    "WHERE b.Id=a.Id) LIMIT 1;"
 )
-sql_co_item = "SELECT Id FROM workflowcompleteitems WHERE TargetEntityId=%s AND Deleted=0 LIMIT 1;"
+sql_co_item = (
+    "SELECT a.Id FROM workflowcompleteitems a WHERE a.TargetEntityId=%s AND a.Deleted=0 "
+    "AND NOT EXISTS(SELECT 1 FROM serviceordercenterhis.workflowcompleteitems b "
+    "WHERE b.Id=a.Id) LIMIT 1;"
+)
 
 # 通过ItemId 查找 StepId
 sql_cu_step = (
@@ -191,12 +202,16 @@ sql_hf = "SET FOREIGN_KEY_CHECKS = 1"
 # 开始时间
 start_time = datetime.now()
 
+
 # 循环每批次单据，假设有10批次(NTILE数值)
-for i in range(0, 10):
+# 按批次号分线程去执行语句（需要保障写入临时表时的分桶数量(从1开始)与所开线程数量(从0开始)相同）
+def insert_data(batch_no):
     cur_his = con_his.cursor()
-    cur_his.execute(sql_move, i)
+    cur_his.execute(sql_move, batch_no)
     res_ids = cur_his.fetchall()
     cur_his.close()
+    batch_num = 0  # 计数器
+    thread_start = datetime.now()
 
     # 先判断有没有取出值
     if res_ids:
@@ -270,10 +285,12 @@ for i in range(0, 10):
                 # 一单迁移完后提交库数据
                 con_his.commit()
                 con_src.commit()
-                batch_end_time = datetime.now()
-                print(
-                    f"单据 {order_id} 迁移耗时 {(batch_end_time - batch_start_time).total_seconds()} 秒！"
-                )
+                batch_num += 1
+                if batch_num / 100 == 0:
+                    batch_end_time = datetime.now()
+                    print(
+                        f"批次号 {batch_no} 已迁移 {batch_num} 行，累计耗时 {(batch_end_time - batch_start_time).total_seconds()} 秒！"
+                    )
             except Exception as e:
                 print(e)
                 con_his.rollback()
@@ -281,9 +298,24 @@ for i in range(0, 10):
             finally:
                 cur_his.close()
                 cur_src.close()
+    thread_end = datetime.now()
+    print(f"批次号 {batch_no} 迁移完成，累计耗时 {(thread_end - thread_start).total_seconds()} 秒！")
+
 
 end_time = datetime.now()
-print(f"全部迁移完成，总计耗时 {(end_time - start_time).total_seconds()} 秒！")
+print(f"全部数据迁移完成，累计耗时 {(end_time - start_time).total_seconds()} 秒！")
 
 con_src.close()
 con_his.close()
+
+# 创建并启动多个线程
+threads = []
+for i in range(num_threads):
+    print(f"线程 {i} 已开启!")
+    thread = threading.Thread(target=insert_data, args=(i + 1,))
+    threads.append(thread)
+    thread.start()
+
+# 等待所有线程完成
+for thread in threads:
+    thread.join()
